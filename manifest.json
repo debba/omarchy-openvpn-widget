@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "id": "community.openvpn",
+  "name": "OpenVPN Manager",
+  "version": "0.1.0",
+  "author": "Community",
+  "license": "MIT",
+  "description": "Manage NetworkManager OpenVPN profiles from the Omarchy bar while keeping credentials in the system keyring.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "OpenVPN Manager",
+    "description": "Import, connect, and disconnect OpenVPN profiles with keyring-backed credentials.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "configDirectory": "~/.config/openvpn",
+      "refreshIntervalSec": 10
+    },
+    "schema": [
+      {
+        "key": "configDirectory",
+        "type": "path",
+        "label": "OpenVPN configuration directory",
+        "defaultValue": "~/.config/openvpn",
+        "description": "Directory containing .ovpn or .conf files. Files are imported into NetworkManager only when used."
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 5,
+        "max": 300,
+        "step": 5,
+        "defaultValue": 10
+      }
+    ]
+  }
+}

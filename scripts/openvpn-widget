@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""NetworkManager/OpenVPN backend for the Omarchy OpenVPN widget."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+from typing import Any
+
+APP_ID = "omarchy-openvpn-widget"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / APP_ID
+STATE_FILE = STATE_DIR / "profiles.json"
+SUPPORTED_SUFFIXES = {".ovpn", ".conf"}
+
+
+class WidgetError(RuntimeError):
+    """An error safe to display in the widget."""
+
+
+def run(command: list[str], *, input_text: str | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(command, input=input_text, text=True, capture_output=True, check=False)
+    except FileNotFoundError as error:
+        raise WidgetError(f"Required command not found: {command[0]}") from error
+    if check and result.returncode != 0:
+        message = (result.stderr or result.stdout or f"{command[0]} failed").strip()
+        raise WidgetError(" ".join(message.split()))
+    return result
+
+
+def emit(payload: dict[str, Any], exit_code: int = 0) -> None:
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    raise SystemExit(exit_code)
+
+
+def expand_directory(raw: str) -> Path:
+    expanded = os.path.expandvars(os.path.expanduser(raw or "~/.config/openvpn"))
+    return Path(expanded).resolve()
+
+
+def config_key(path: Path) -> str:
+    return hashlib.sha256(str(path.resolve()).encode()).hexdigest()
+
+
+def load_state() -> dict[str, dict[str, str]]:
+    try:
+        value = json.loads(STATE_FILE.read_text())
+        return value if isinstance(value, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_state(state: dict[str, dict[str, str]]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = STATE_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(state, indent=2) + "\n")
+    os.chmod(temporary, 0o600)
+    temporary.replace(STATE_FILE)
+
+
+def parse_terse_line(line: str) -> list[str]:
+    fields: list[str] = []
+    current: list[str] = []
+    escaped = False
+    for character in line.rstrip("\n"):
+        if escaped:
+            current.append(character)
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == ":":
+            fields.append("".join(current))
+            current = []
+        else:
+            current.append(character)
+    if escaped:
+        current.append("\\")
+    fields.append("".join(current))
+    return fields
+
+
+def nm_connections(active_only: bool = False) -> dict[str, dict[str, Any]]:
+    command = ["nmcli", "--terse", "--escape", "yes", "--fields", "UUID,NAME,TYPE", "connection", "show"]
+    if active_only:
+        command.append("--active")
+    output = run(command).stdout
+    connections: dict[str, dict[str, Any]] = {}
+    for line in output.splitlines():
+        fields = parse_terse_line(line)
+        if len(fields) < 3:
+            continue
+        uuid, name, connection_type = fields[:3]
+        connections[uuid] = {"uuid": uuid, "name": name, "type": connection_type, "active": active_only}
+    return connections
+
+
+def secret_lookup(path: Path, field: str) -> str:
+    result = run(
+        ["secret-tool", "lookup", "service", APP_ID, "config", config_key(path), "field", field],
+        check=False,
+    )
+    return result.stdout.rstrip("\n") if result.returncode == 0 else ""
+
+
+def secret_store(path: Path, field: str, value: str) -> None:
+    label = f"OpenVPN {field} for {path.stem}"
+    run(
+        ["secret-tool", "store", "--label", label, "service", APP_ID, "config", config_key(path), "field", field],
+        input_text=value,
+    )
+
+
+def secret_clear(path: Path) -> None:
+    run(["secret-tool", "clear", "service", APP_ID, "config", config_key(path)], check=False)
+
+
+def discover(directory: Path) -> list[Path]:
+    if not directory.is_dir():
+        return []
+    return sorted(
+        (item.resolve() for item in directory.iterdir() if item.is_file() and item.suffix.lower() in SUPPORTED_SUFFIXES),
+        key=lambda item: item.name.casefold(),
+    )
+
+
+def require_config(raw: str) -> Path:
+    path = Path(os.path.expandvars(os.path.expanduser(raw))).resolve()
+    if not path.is_file() or path.suffix.lower() not in SUPPORTED_SUFFIXES:
+        raise WidgetError("The selected OpenVPN configuration does not exist")
+    return path
+
+
+def unique_connection_name(path: Path, connections: dict[str, dict[str, Any]]) -> str:
+    base = f"OpenVPN · {path.stem}"
+    names = {entry["name"] for entry in connections.values()}
+    if base not in names:
+        return base
+    index = 2
+    while f"{base} ({index})" in names:
+        index += 1
+    return f"{base} ({index})"
+
+
+def ensure_imported(path: Path, state: dict[str, dict[str, str]]) -> dict[str, str]:
+    key = str(path)
+    connections = nm_connections()
+    existing = state.get(key, {})
+    if existing.get("uuid") in connections:
+        return existing
+
+    before = set(connections)
+    run(["nmcli", "connection", "import", "type", "openvpn", "file", str(path)])
+    after = nm_connections()
+    imported = [uuid for uuid in after if uuid not in before and after[uuid]["type"] == "vpn"]
+    if len(imported) != 1:
+        raise WidgetError("NetworkManager imported the profile but its UUID could not be identified")
+
+    uuid = imported[0]
+    name = unique_connection_name(path, connections)
+    run(["nmcli", "connection", "modify", "uuid", uuid, "connection.id", name])
+    state[key] = {"uuid": uuid, "name": name}
+    save_state(state)
+    return state[key]
+
+
+def command_list(args: argparse.Namespace) -> None:
+    directory = expand_directory(args.config_dir)
+    state = load_state()
+    all_connections = nm_connections()
+    active_connections = nm_connections(active_only=True)
+    changed = False
+    profiles = []
+
+    for path in discover(directory):
+        record = state.get(str(path), {})
+        uuid = record.get("uuid", "")
+        if uuid and uuid not in all_connections:
+            state.pop(str(path), None)
+            record = {}
+            uuid = ""
+            changed = True
+        profiles.append(
+            {
+                "path": str(path),
+                "fileName": path.name,
+                "name": record.get("name", path.stem),
+                "uuid": uuid,
+                "imported": bool(uuid),
+                "active": uuid in active_connections,
+                "hasCredentials": bool(secret_lookup(path, "username") and secret_lookup(path, "password")),
+            }
+        )
+
+    if changed:
+        save_state(state)
+    emit({"ok": True, "directory": str(directory), "directoryExists": directory.is_dir(), "profiles": profiles})
+
+
+def read_credentials() -> tuple[str, str]:
+    try:
+        payload = json.loads(sys.stdin.readline())
+    except json.JSONDecodeError as error:
+        raise WidgetError("Invalid credentials payload") from error
+    username = str(payload.get("username", "")).strip()
+    password = str(payload.get("password", ""))
+    if not username or not password:
+        raise WidgetError("Username and password are required")
+    return username, password
+
+
+def command_save_credentials(args: argparse.Namespace) -> None:
+    path = require_config(args.config)
+    username, password = read_credentials()
+    secret_store(path, "username", username)
+    secret_store(path, "password", password)
+    emit({"ok": True, "message": f"Credentials saved for {path.stem}"})
+
+
+def command_connect(args: argparse.Namespace) -> None:
+    path = require_config(args.config)
+    username = secret_lookup(path, "username")
+    password = secret_lookup(path, "password")
+    if not username or not password:
+        raise WidgetError("Save credentials before connecting")
+
+    state = load_state()
+    record = ensure_imported(path, state)
+    run(["nmcli", "connection", "modify", "uuid", record["uuid"], "vpn.user-name", username])
+
+    descriptor, password_file = tempfile.mkstemp(prefix="openvpn-widget-", text=True)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write(f"vpn.secrets.password:{password}\n")
+        run(["nmcli", "connection", "up", "uuid", record["uuid"], "passwd-file", password_file])
+    finally:
+        # The username is persisted only long enough to activate the profile.
+        # The active connection keeps its own snapshot; the saved profile goes
+        # back to having both credentials exclusively in Secret Service.
+        run(["nmcli", "connection", "modify", "uuid", record["uuid"], "vpn.user-name", ""], check=False)
+        try:
+            os.unlink(password_file)
+        except FileNotFoundError:
+            pass
+    emit({"ok": True, "message": f"Connected to {record['name']}"})
+
+
+def command_disconnect(args: argparse.Namespace) -> None:
+    path = require_config(args.config)
+    record = load_state().get(str(path), {})
+    if not record.get("uuid"):
+        raise WidgetError("The profile is not imported")
+    run(["nmcli", "connection", "down", "uuid", record["uuid"]])
+    emit({"ok": True, "message": f"Disconnected from {record.get('name', path.stem)}"})
+
+
+def command_forget(args: argparse.Namespace) -> None:
+    path = require_config(args.config)
+    state = load_state()
+    record = state.pop(str(path), {})
+    if record.get("uuid"):
+        run(["nmcli", "connection", "delete", "uuid", record["uuid"]], check=False)
+    secret_clear(path)
+    save_state(state)
+    emit({"ok": True, "message": f"Removed {path.stem} credentials and imported profile"})
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(description=__doc__)
+    subparsers = root.add_subparsers(dest="command", required=True)
+
+    list_parser = subparsers.add_parser("list")
+    list_parser.add_argument("--config-dir", default="~/.config/openvpn")
+    list_parser.set_defaults(handler=command_list)
+
+    for name, handler in (
+        ("save-credentials", command_save_credentials),
+        ("connect", command_connect),
+        ("disconnect", command_disconnect),
+        ("forget", command_forget),
+    ):
+        action_parser = subparsers.add_parser(name)
+        action_parser.add_argument("--config", required=True)
+        action_parser.set_defaults(handler=handler)
+    return root
+
+
+def main() -> None:
+    args = parser().parse_args()
+    try:
+        args.handler(args)
+    except WidgetError as error:
+        emit({"ok": False, "error": str(error)}, 1)
+    except Exception as error:  # Keep unexpected failures visible without exposing a traceback in the panel.
+        emit({"ok": False, "error": f"Unexpected backend error: {error}"}, 1)
+
+
+if __name__ == "__main__":
+    main()
