@@ -162,7 +162,8 @@ def ensure_imported(path: Path, state: dict[str, dict[str, str]]) -> dict[str, s
         raise WidgetError("NetworkManager imported the profile but its UUID could not be identified")
 
     uuid = imported[0]
-    name = unique_connection_name(path, connections)
+    # A custom name can be assigned before the profile is first imported.
+    name = existing.get("name") or unique_connection_name(path, connections)
     run(["nmcli", "connection", "modify", "uuid", uuid, "connection.id", name])
     state[key] = {"uuid": uuid, "name": name}
     save_state(state)
@@ -220,6 +221,30 @@ def command_save_credentials(args: argparse.Namespace) -> None:
     secret_store(path, "username", username)
     secret_store(path, "password", password)
     emit({"ok": True, "message": f"Credentials saved for {path.stem}"})
+
+
+def command_rename(args: argparse.Namespace) -> None:
+    path = require_config(args.config)
+    try:
+        payload = json.loads(sys.stdin.readline())
+    except json.JSONDecodeError as error:
+        raise WidgetError("Invalid profile name payload") from error
+    name = str(payload.get("name", "")).strip()
+    if not name:
+        raise WidgetError("Profile name is required")
+
+    state = load_state()
+    record = state.setdefault(str(path), {})
+    uuid = record.get("uuid", "")
+    if uuid:
+        connections = nm_connections()
+        if uuid in connections:
+            run(["nmcli", "connection", "modify", "uuid", uuid, "connection.id", name])
+        else:
+            record.pop("uuid", None)
+    record["name"] = name
+    save_state(state)
+    emit({"ok": True, "message": f"Profile renamed to {name}"})
 
 
 def command_connect(args: argparse.Namespace) -> None:
@@ -281,6 +306,7 @@ def parser() -> argparse.ArgumentParser:
 
     for name, handler in (
         ("save-credentials", command_save_credentials),
+        ("rename", command_rename),
         ("connect", command_connect),
         ("disconnect", command_disconnect),
         ("forget", command_forget),

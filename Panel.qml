@@ -25,6 +25,8 @@ Panel {
   property string activeProfileName: ""
   property string editPath: ""
   property string editName: ""
+  property string renamePath: ""
+  property string renameText: ""
   property string usernameText: ""
   property string passwordText: ""
   property string message: ""
@@ -52,6 +54,7 @@ Panel {
   }
 
   function openCredentials(profile, thenConnect) {
+    closeRename()
     editPath = profile.path
     editName = profile.name
     usernameText = ""
@@ -67,6 +70,31 @@ Panel {
     passwordText = ""
     connectAfterSave = false
     if (opened) Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  function openRename(profile) {
+    closeCredentials()
+    renamePath = profile.path
+    renameText = profile.name
+    Qt.callLater(function() {
+      profileNameField.forceActiveFocus()
+      profileNameField.selectAll()
+    })
+  }
+
+  function closeRename() {
+    renamePath = ""
+    renameText = ""
+    if (opened && editPath === "") Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  function saveRename() {
+    var name = renameText.trim()
+    if (name === "") {
+      errorMessage = "Profile name is required"
+      return
+    }
+    runAction("rename", renamePath, JSON.stringify({ name: name }) + "\n")
   }
 
   function runAction(kind, path, input) {
@@ -163,6 +191,7 @@ Panel {
         root.message = result.message || "Done"
         root.errorMessage = ""
         if (completedKind === "save-credentials") root.closeCredentials()
+        if (completedKind === "rename") root.closeRename()
         if (shouldConnect) Qt.callLater(function() { root.runAction("connect", completedPath) })
         else root.refresh()
       } else {
@@ -205,7 +234,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: root.editPath !== ""
+      blocked: root.editPath !== "" || root.renamePath !== ""
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(text) { if (text === "r" || text === "R") root.refresh() }
@@ -339,6 +368,27 @@ Panel {
                   }
 
                   PanelActionButton {
+                    visible: !modelData.active
+                    iconText: "󰍂"
+                    tooltipText: "Connect"
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    Layout.alignment: Qt.AlignVCenter
+                    onClicked: root.activate(modelData)
+                  }
+
+                  PanelActionButton {
+                    visible: !modelData.active
+                    iconText: "󰏫"
+                    tooltipText: "Rename profile"
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    Layout.alignment: Qt.AlignVCenter
+                    onClicked: root.openRename(modelData)
+                  }
+
+                  PanelActionButton {
+                    visible: !modelData.active
                     iconText: "󰌆"
                     tooltipText: "Edit keyring credentials"
                     foreground: root.foreground
@@ -348,7 +398,7 @@ Panel {
                   }
 
                   PanelActionButton {
-                    visible: modelData.imported || modelData.hasCredentials
+                    visible: !modelData.active && (modelData.imported || modelData.hasCredentials)
                     iconText: "󰆴"
                     tooltipText: "Forget profile and credentials"
                     foreground: root.foreground
@@ -356,7 +406,61 @@ Panel {
                     Layout.alignment: Qt.AlignVCenter
                     onClicked: root.runAction("forget", modelData.path)
                   }
+
+                  PanelActionButton {
+                    visible: modelData.active
+                    iconText: "󰍃"
+                    tooltipText: "Disconnect"
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    Layout.alignment: Qt.AlignVCenter
+                    onClicked: root.runAction("disconnect", modelData.path)
+                  }
                 }
+              }
+            }
+          }
+
+          Column {
+            visible: root.renamePath !== ""
+            width: parent.width
+            spacing: Style.space(8)
+
+            PanelSeparator { width: parent.width; foreground: root.foreground }
+            PanelSectionHeader {
+              text: "PROFILE NAME"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            TextField {
+              id: profileNameField
+              width: parent.width
+              foreground: root.foreground
+              placeholderText: "Profile name"
+              text: root.renameText
+              onTextChanged: root.renameText = text
+              onAccepted: root.saveRename()
+              Keys.onEscapePressed: root.closeRename()
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.space(8)
+
+              Button {
+                text: "Save name"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                bordered: true
+                enabled: !actionProcess.running
+                onClicked: root.saveRename()
+              }
+              Button {
+                text: "Cancel"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                onClicked: root.closeRename()
               }
             }
           }

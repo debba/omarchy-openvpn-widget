@@ -1,94 +1,130 @@
 # OpenVPN Manager for Omarchy
 
-A native Omarchy/Quickshell bar widget for importing and controlling OpenVPN profiles through NetworkManager.
+[![Tests](https://github.com/debba/omarchy-openvpn-widget/actions/workflows/test.yml/badge.svg)](https://github.com/debba/omarchy-openvpn-widget/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-## Features
+A native [Omarchy](https://omarchy.org/) bar widget for managing OpenVPN profiles through NetworkManager. Connect, disconnect, rename, and manage credentials without leaving the bar.
 
-- Discovers `.ovpn` and `.conf` files in a configurable directory.
-- Imports profiles into NetworkManager only when they are first used.
-- Connects and disconnects VPNs from the top-right bar.
-- Stores usernames and passwords in the desktop Secret Service keyring through `secret-tool`.
-- Never puts passwords in command-line arguments or in `shell.json`.
-- Removes its temporary NetworkManager password file immediately after activation.
-- Supports Omarchy's widget settings and theme components.
+<p align="center">
+  <img src="docs/screenshot.png" alt="OpenVPN Manager widget for Omarchy" width="616">
+</p>
+
+## Highlights
+
+- Discovers `.ovpn` and `.conf` profiles from a configurable directory.
+- Imports a profile into NetworkManager only when it is first used.
+- Provides a dedicated **Connect** action for inactive profiles.
+- Shows only the **Disconnect** action while a profile is active.
+- Supports custom display names without renaming configuration files.
+- Stores credentials in the desktop Secret Service keyring.
+- Integrates with Omarchy's bar settings and current theme.
+- Refreshes connection state automatically.
+
+## Security
+
+Passwords are never stored in `shell.json`, the plugin state file, or command-line arguments.
+
+Credentials are saved through `secret-tool` as Secret Service items. During activation, the password is written to a temporary file with mode `0600`, passed to NetworkManager, and immediately removed. The NetworkManager profile is then cleared of the persisted username as well.
+
+The local state file is stored at:
+
+```text
+~/.local/state/omarchy-openvpn-widget/profiles.json
+```
+
+It contains only profile paths, NetworkManager UUIDs, and custom display names.
 
 ## Requirements
 
-- Omarchy with the current Quickshell-based shell plugin API
+- Omarchy with the Quickshell plugin API
 - NetworkManager
-- OpenVPN and `networkmanager-openvpn`
-- `libsecret` and an active Secret Service provider such as GNOME Keyring
+- OpenVPN
+- `networkmanager-openvpn`
+- `libsecret`
+- An active Secret Service provider, such as GNOME Keyring
 
-## Install from a clone
+The included installer installs the required packages through `omarchy pkg add`.
 
-```bash
-git clone https://github.com/YOUR_GITHUB_USERNAME/omarchy-openvpn-widget.git
-cd omarchy-openvpn-widget
-./install.sh
-```
+## Installation
 
-The installer uses `omarchy pkg add`, validates the plugin, and places it in the right section of the bar. It may ask for your administrator password.
-
-## Install through the Omarchy plugin manager
-
-Once this repository has a public GitHub URL:
+### Omarchy plugin manager
 
 ```bash
 omarchy pkg add openvpn networkmanager networkmanager-openvpn libsecret gnome-keyring
-omarchy plugin add https://github.com/YOUR_GITHUB_USERNAME/omarchy-openvpn-widget.git --enable
+omarchy plugin add https://github.com/debba/omarchy-openvpn-widget.git --enable
 ```
 
-If needed, place it explicitly:
+The widget defaults to the right section of the bar. If necessary, move it explicitly:
 
 ```bash
 omarchy bar move community.openvpn --section right
 ```
 
+### Install from a clone
+
+```bash
+git clone https://github.com/debba/omarchy-openvpn-widget.git
+cd omarchy-openvpn-widget
+./install.sh
+```
+
+The installer validates the plugin, copies it into the Omarchy user plugin directory, and enables it in the right section of the bar.
+
 ## Configuration
 
-1. Put your provider files in `~/.config/openvpn`, or open the Omarchy bar settings and set **OpenVPN configuration directory** for this widget.
-2. Open the shield icon in the bar.
-3. Select a profile.
-4. Enter its username and password. They are saved in the system keyring.
-5. Select the profile again to disconnect or reconnect.
+1. Place the provider's `.ovpn` or `.conf` files in `~/.config/openvpn`.
+2. Alternatively, open the Omarchy bar settings and change **OpenVPN configuration directory**.
+3. Open the shield icon in the bar.
+4. Use the connect icon beside a profile.
+5. Enter the VPN username and password when prompted.
 
-The directory is scanned non-recursively. Certificate and key paths referenced by an OpenVPN file must remain valid after NetworkManager imports it.
+The profile list is scanned non-recursively. Certificate and key paths referenced by an OpenVPN file must remain valid after NetworkManager imports it.
 
-## Credential handling
+### Profile actions
 
-Credentials are stored as Secret Service items with these attributes:
+When a profile is disconnected, the widget provides actions to:
 
-- `service=omarchy-openvpn-widget`
-- `config=<SHA-256 of the canonical configuration path>`
-- `field=username` or `field=password`
+- connect;
+- assign a custom display name;
+- save or replace keyring credentials;
+- forget the imported NetworkManager profile and its credentials.
 
-The state file at `~/.local/state/omarchy-openvpn-widget/profiles.json` contains only configuration paths, NetworkManager UUIDs, and display names. It does not contain credentials.
+When a profile is connected, these actions are replaced by a single disconnect button.
 
-Selecting the trash action beside a profile removes both the imported NetworkManager connection and matching keyring items. The original `.ovpn`/`.conf` file is never modified or deleted.
+Forgetting a profile does **not** delete or modify the original `.ovpn` or `.conf` file.
+
+## Widget settings
+
+| Setting | Default | Description |
+| --- | --- | --- |
+| `configDirectory` | `~/.config/openvpn` | Directory containing OpenVPN profiles |
+| `refreshIntervalSec` | `10` | Connection-state refresh interval in seconds |
 
 ## Development
+
+Run the backend tests and validate the plugin:
 
 ```bash
 python -m unittest discover -s tests -v
 omarchy plugin validate .
 ```
 
-For live development, link the repository into the user plugin directory and rescan:
+For live development, link the repository into the user plugin directory:
 
 ```bash
-ln -s "$PWD" ~/.config/omarchy/plugins/community.openvpn
-omarchy-shell shell rescanPlugins
+ln -sfn "$PWD" ~/.config/omarchy/plugins/community.openvpn
 omarchy plugin enable community.openvpn --section right
+omarchy restart shell
 ```
 
-## Uninstall
+## Uninstallation
 
 ```bash
 ./uninstall.sh
 ```
 
-Package removal is intentionally left to the user because OpenVPN and NetworkManager may be used by other applications.
+The uninstall script removes only the widget. Imported NetworkManager profiles, keyring entries, and system packages are intentionally preserved.
 
 ## License
 
-MIT
+Released under the [MIT License](LICENSE).

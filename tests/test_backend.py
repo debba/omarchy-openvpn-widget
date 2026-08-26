@@ -4,6 +4,7 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import call, patch
 
 BACKEND = Path(__file__).parents[1] / "scripts" / "openvpn-widget"
 module = SourceFileLoader("openvpn_widget", str(BACKEND)).load_module()
@@ -33,6 +34,28 @@ class BackendTests(unittest.TestCase):
             path.touch()
             self.assertEqual(module.config_key(path), module.config_key(path.resolve()))
             self.assertEqual(len(module.config_key(path)), 64)
+
+    def test_import_uses_name_assigned_before_first_connection(self):
+        path = Path("/tmp/office.ovpn")
+        state = {str(path): {"name": "Main office"}}
+        imported = {"vpn-uuid": {"uuid": "vpn-uuid", "name": "office", "type": "vpn"}}
+
+        with (
+            patch.object(module, "nm_connections", side_effect=[{}, imported]),
+            patch.object(module, "run") as run,
+            patch.object(module, "save_state") as save_state,
+        ):
+            record = module.ensure_imported(path, state)
+
+        self.assertEqual(record, {"uuid": "vpn-uuid", "name": "Main office"})
+        self.assertEqual(
+            run.call_args_list,
+            [
+                call(["nmcli", "connection", "import", "type", "openvpn", "file", str(path)]),
+                call(["nmcli", "connection", "modify", "uuid", "vpn-uuid", "connection.id", "Main office"]),
+            ],
+        )
+        save_state.assert_called_once_with(state)
 
 
 if __name__ == "__main__":
