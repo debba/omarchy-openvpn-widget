@@ -6,7 +6,7 @@
 A native [Omarchy](https://omarchy.org/) bar widget for managing OpenVPN profiles through NetworkManager. Connect, disconnect, rename, and manage credentials without leaving the bar.
 
 <p align="center">
-  <img src="docs/screenshot.png" alt="OpenVPN Manager widget for Omarchy" width="616">
+  <img src="preview.png" alt="OpenVPN Manager widget for Omarchy" width="616">
 </p>
 
 ## Highlights
@@ -36,7 +36,8 @@ It contains only profile paths, NetworkManager UUIDs, and custom display names.
 
 ## Requirements
 
-- Omarchy with the Quickshell plugin API
+- Omarchy 4.x with the Quickshell plugin API
+- Python 3 (standard library only; no additional Python packages)
 - NetworkManager
 - OpenVPN
 - `networkmanager-openvpn`
@@ -68,7 +69,15 @@ cd omarchy-openvpn-widget
 ./install.sh
 ```
 
-The installer validates the plugin, copies it into the Omarchy user plugin directory, and enables it in the right section of the bar.
+The installer validates the plugin, installs its system dependencies, copies it into the Omarchy user plugin directory, and enables it in the right section of the bar. It refuses to replace an existing installation before installing any packages.
+
+To explicitly back up and replace an existing installation:
+
+```bash
+./install.sh --replace
+```
+
+The previous installation is preserved in a hidden `.community.openvpn.backup.*` directory alongside the installed plugins. Running the installer from the installed directory or its own development symlink does not replace it.
 
 ## Configuration
 
@@ -119,11 +128,15 @@ omarchy restart shell
 
 ## Uninstallation
 
+For an installation made with the plugin manager:
+
 ```bash
-./uninstall.sh
+omarchy plugin remove community.openvpn
 ```
 
-The uninstall script removes only the widget. Imported NetworkManager profiles, keyring entries, and system packages are intentionally preserved.
+For an installation made with `./install.sh`, run `./uninstall.sh` from the checkout to remove the installed widget.
+
+Both methods intentionally preserve imported NetworkManager profiles, keyring entries, local state, and system packages. To delete imported profiles and credentials, use the widget's **Forget** action before uninstalling; original configuration files remain untouched.
 
 ## License
 

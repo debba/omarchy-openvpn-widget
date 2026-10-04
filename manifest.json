@@ -3,7 +3,7 @@
   "id": "community.openvpn",
   "name": "OpenVPN Manager",
   "version": "0.1.0",
-  "author": "Community",
+  "author": "debba",
   "license": "MIT",
   "description": "Manage NetworkManager OpenVPN profiles from the Omarchy bar while keeping credentials in the system keyring.",
   "kinds": ["bar-widget"],
