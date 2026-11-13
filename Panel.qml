@@ -20,9 +20,11 @@ Panel {
   readonly property string configDirectory: String(setting("configDirectory", "~/.config/openvpn"))
   readonly property int refreshIntervalSec: Math.max(5, Number(setting("refreshIntervalSec", 10)) || 10)
   readonly property bool anyActive: activeProfileName !== ""
+  readonly property bool anyConnecting: connectingProfileName !== ""
 
   property var profiles: []
   property string activeProfileName: ""
+  property string connectingProfileName: ""
   property string editPath: ""
   property string editName: ""
   property string renamePath: ""
@@ -35,6 +37,10 @@ Panel {
   property string actionPath: ""
   property string actionInput: ""
   property bool connectAfterSave: false
+  property bool askPasswordChoice: false
+  property string promptPath: ""
+  property string promptName: ""
+  property string promptText: ""
 
   implicitWidth: barButton.implicitWidth
   implicitHeight: barButton.implicitHeight
@@ -57,8 +63,10 @@ Panel {
     closeRename()
     editPath = profile.path
     editName = profile.name
+    closePasswordPrompt()
     usernameText = ""
     passwordText = ""
+    askPasswordChoice = profile.askPassword === true
     connectAfterSave = thenConnect === true
     Qt.callLater(function() { usernameField.forceActiveFocus() })
   }
@@ -68,8 +76,43 @@ Panel {
     editName = ""
     usernameText = ""
     passwordText = ""
+    askPasswordChoice = false
     connectAfterSave = false
     if (opened) Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  // Asks for the password of a profile in "ask on every connection" mode,
+  // typically a one-time password that must never be stored or replayed.
+  function openPasswordPrompt(path, name) {
+    closeRename()
+    closeCredentials()
+    promptPath = path
+    promptName = name
+    promptText = ""
+    Qt.callLater(function() { promptField.forceActiveFocus() })
+  }
+
+  function closePasswordPrompt() {
+    promptPath = ""
+    promptName = ""
+    promptText = ""
+    if (opened && editPath === "" && renamePath === "") Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  function submitPasswordPrompt() {
+    if (promptText === "") {
+      errorMessage = "Password is required"
+      return
+    }
+    var path = promptPath
+    var payload = JSON.stringify({ password: promptText }) + "\n"
+    closePasswordPrompt()
+    runAction("connect", path, payload, ["--password-stdin"])
+  }
+
+  function connectProfile(profile) {
+    if (profile.askPassword) openPasswordPrompt(profile.path, profile.name)
+    else runAction("connect", profile.path)
   }
 
   function openRename(profile) {
@@ -97,32 +140,50 @@ Panel {
     runAction("rename", renamePath, JSON.stringify({ name: name }) + "\n")
   }
 
-  function runAction(kind, path, input) {
+  function runAction(kind, path, input, extraArgs) {
     if (actionProcess.running) return
     actionKind = kind
     actionPath = path
     actionInput = input || ""
     message = ""
     errorMessage = ""
-    actionProcess.command = [helperPath, kind, "--config", path]
+    actionProcess.command = [helperPath, kind, "--config", path].concat(extraArgs || [])
     actionProcess.running = true
   }
 
+  // Disconnecting runs in its own process so it also works while a "connect"
+  // action is still blocked waiting for NetworkManager.
+  function disconnect(path) {
+    if (disconnectProcess.running) return
+    message = ""
+    errorMessage = ""
+    disconnectProcess.command = [helperPath, "disconnect", "--config", path]
+    disconnectProcess.running = true
+  }
+
   function activate(profile) {
-    if (!profile || actionProcess.running) return
-    if (profile.active) runAction("disconnect", profile.path)
-    else if (profile.hasCredentials) runAction("connect", profile.path)
+    if (!profile) return
+    if (profile.active || profile.connecting) {
+      disconnect(profile.path)
+      return
+    }
+    if (actionProcess.running) return
+    if (profile.hasCredentials) connectProfile(profile)
     else openCredentials(profile, true)
   }
 
   function saveCredentials() {
     var username = usernameText.trim()
     var password = passwordText
-    if (username === "" || password === "") {
-      errorMessage = "Username and password are required"
+    if (username === "" || (password === "" && !askPasswordChoice)) {
+      errorMessage = askPasswordChoice ? "Username is required" : "Username and password are required"
       return
     }
-    var payload = JSON.stringify({ username: username, password: password }) + "\n"
+    var payload = JSON.stringify({
+      username: username,
+      password: askPasswordChoice ? "" : password,
+      askPassword: askPasswordChoice
+    }) + "\n"
     usernameText = ""
     passwordText = ""
     runAction("save-credentials", editPath, payload)
@@ -151,11 +212,11 @@ Panel {
       if (exitCode === 0 && result.ok) {
         root.profiles = result.profiles || []
         root.activeProfileName = ""
+        root.connectingProfileName = ""
         for (var index = 0; index < root.profiles.length; index++) {
-          if (root.profiles[index].active) {
-            root.activeProfileName = root.profiles[index].name
-            break
-          }
+          var profile = root.profiles[index]
+          if (profile.active && root.activeProfileName === "") root.activeProfileName = profile.name
+          if (profile.connecting && root.connectingProfileName === "") root.connectingProfileName = profile.name
         }
         if (!result.directoryExists)
           root.errorMessage = "Configuration directory not found: " + result.directory
@@ -192,12 +253,33 @@ Panel {
         root.errorMessage = ""
         if (completedKind === "save-credentials") root.closeCredentials()
         if (completedKind === "rename") root.closeRename()
-        if (shouldConnect) Qt.callLater(function() { root.runAction("connect", completedPath) })
+        if (shouldConnect && result.askPassword) {
+          var profileName = completedPath
+          for (var index = 0; index < root.profiles.length; index++)
+            if (root.profiles[index].path === completedPath) profileName = root.profiles[index].name
+          root.openPasswordPrompt(completedPath, profileName)
+        }
+        else if (shouldConnect) Qt.callLater(function() { root.runAction("connect", completedPath) })
         else root.refresh()
       } else {
         root.errorMessage = result.error || String(actionError.text || "OpenVPN action failed").trim()
         root.connectAfterSave = false
+        root.refresh()
       }
+    }
+  }
+
+  Process {
+    id: disconnectProcess
+    running: false
+    command: []
+    stdout: StdioCollector { id: disconnectOutput; waitForEnd: true }
+    stderr: StdioCollector { id: disconnectError; waitForEnd: true }
+    onExited: function(exitCode) {
+      var result = root.parseResult(disconnectOutput.text)
+      if (exitCode === 0 && result.ok) root.message = result.message || "Disconnected"
+      else root.errorMessage = result.error || String(disconnectError.text || "Could not disconnect").trim()
+      root.refresh()
     }
   }
 
@@ -234,7 +316,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: root.editPath !== "" || root.renamePath !== ""
+      blocked: root.editPath !== "" || root.renamePath !== "" || root.promptPath !== ""
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(text) { if (text === "r" || text === "R") root.refresh() }
@@ -255,8 +337,8 @@ Panel {
 
           PanelHero {
             width: parent.width
-            title: root.anyActive ? root.activeProfileName : "OpenVPN"
-            meta: root.anyActive ? "CONNECTED" : "DISCONNECTED"
+            title: root.anyActive ? root.activeProfileName : (root.anyConnecting ? root.connectingProfileName : "OpenVPN")
+            meta: root.anyActive ? "CONNECTED" : (root.anyConnecting ? "CONNECTING" : "DISCONNECTED")
             foreground: root.foreground
             fontFamily: root.fontFamily
             iconComponent: Component {
@@ -359,7 +441,11 @@ Panel {
                     }
                     Text {
                       Layout.fillWidth: true
-                      text: modelData.active ? "Connected" : (modelData.hasCredentials ? "Credentials saved" : "Credentials required")
+                      text: modelData.active ? "Connected"
+                          : modelData.connecting ? "Connecting…"
+                          : !modelData.hasCredentials ? "Credentials required"
+                          : modelData.askPassword ? "Password asked on each connection"
+                          : "Credentials saved"
                       color: root.dim
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
@@ -368,7 +454,7 @@ Panel {
                   }
 
                   PanelActionButton {
-                    visible: !modelData.active
+                    visible: !modelData.active && !modelData.connecting
                     iconText: "󰍂"
                     tooltipText: "Connect"
                     foreground: root.foreground
@@ -378,7 +464,7 @@ Panel {
                   }
 
                   PanelActionButton {
-                    visible: !modelData.active
+                    visible: !modelData.active && !modelData.connecting
                     iconText: "󰏫"
                     tooltipText: "Rename profile"
                     foreground: root.foreground
@@ -388,7 +474,7 @@ Panel {
                   }
 
                   PanelActionButton {
-                    visible: !modelData.active
+                    visible: !modelData.active && !modelData.connecting
                     iconText: "󰌆"
                     tooltipText: "Edit keyring credentials"
                     foreground: root.foreground
@@ -398,7 +484,7 @@ Panel {
                   }
 
                   PanelActionButton {
-                    visible: !modelData.active && (modelData.imported || modelData.hasCredentials)
+                    visible: !modelData.active && !modelData.connecting && (modelData.imported || modelData.hasCredentials)
                     iconText: "󰆴"
                     tooltipText: "Forget profile and credentials"
                     foreground: root.foreground
@@ -408,13 +494,13 @@ Panel {
                   }
 
                   PanelActionButton {
-                    visible: modelData.active
+                    visible: modelData.active === true || modelData.connecting === true
                     iconText: "󰍃"
-                    tooltipText: "Disconnect"
+                    tooltipText: modelData.connecting ? "Cancel connection" : "Disconnect"
                     foreground: root.foreground
                     fontFamily: root.fontFamily
                     Layout.alignment: Qt.AlignVCenter
-                    onClicked: root.runAction("disconnect", modelData.path)
+                    onClicked: root.disconnect(modelData.path)
                   }
                 }
               }
@@ -466,6 +552,51 @@ Panel {
           }
 
           Column {
+            visible: root.promptPath !== ""
+            width: parent.width
+            spacing: Style.space(8)
+
+            PanelSeparator { width: parent.width; foreground: root.foreground }
+            PanelSectionHeader {
+              text: "PASSWORD · " + root.promptName.toUpperCase()
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            TextField {
+              id: promptField
+              width: parent.width
+              foreground: root.foreground
+              placeholderText: "Password or one-time code"
+              password: true
+              text: root.promptText
+              onTextChanged: root.promptText = text
+              onAccepted: root.submitPasswordPrompt()
+              Keys.onEscapePressed: root.closePasswordPrompt()
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.space(8)
+
+              Button {
+                text: "Connect"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                bordered: true
+                enabled: !actionProcess.running
+                onClicked: root.submitPasswordPrompt()
+              }
+              Button {
+                text: "Cancel"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                onClicked: root.closePasswordPrompt()
+              }
+            }
+          }
+
+          Column {
             visible: root.editPath !== ""
             width: parent.width
             spacing: Style.space(8)
@@ -484,12 +615,23 @@ Panel {
               placeholderText: "Username"
               text: root.usernameText
               onTextChanged: root.usernameText = text
-              onAccepted: passwordField.forceActiveFocus()
+              onAccepted: root.askPasswordChoice ? root.saveCredentials() : passwordField.forceActiveFocus()
               Keys.onEscapePressed: root.closeCredentials()
+            }
+
+            Toggle {
+              width: parent.width
+              label: "Ask for the password on every connection"
+              description: "For one-time passwords (OTP/MFA). Only the username is stored."
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              checked: root.askPasswordChoice
+              onClicked: root.askPasswordChoice = !root.askPasswordChoice
             }
 
             TextField {
               id: passwordField
+              visible: !root.askPasswordChoice
               width: parent.width
               foreground: root.foreground
               placeholderText: "Password"

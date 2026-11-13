@@ -17,6 +17,7 @@ APP_ID = "omarchy-openvpn-widget"
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / APP_ID
 STATE_FILE = STATE_DIR / "profiles.json"
 SUPPORTED_SUFFIXES = {".ovpn", ".conf"}
+CONNECT_TIMEOUT_SEC = 45
 
 
 class WidgetError(RuntimeError):
@@ -85,10 +86,8 @@ def parse_terse_line(line: str) -> list[str]:
     return fields
 
 
-def nm_connections(active_only: bool = False) -> dict[str, dict[str, Any]]:
+def nm_connections() -> dict[str, dict[str, Any]]:
     command = ["nmcli", "--terse", "--escape", "yes", "--fields", "UUID,NAME,TYPE", "connection", "show"]
-    if active_only:
-        command.append("--active")
     output = run(command).stdout
     connections: dict[str, dict[str, Any]] = {}
     for line in output.splitlines():
@@ -96,8 +95,24 @@ def nm_connections(active_only: bool = False) -> dict[str, dict[str, Any]]:
         if len(fields) < 3:
             continue
         uuid, name, connection_type = fields[:3]
-        connections[uuid] = {"uuid": uuid, "name": name, "type": connection_type, "active": active_only}
+        connections[uuid] = {"uuid": uuid, "name": name, "type": connection_type}
     return connections
+
+
+def nm_active_states() -> dict[str, str]:
+    """Map active connection UUIDs to their NetworkManager state.
+
+    The state is one of activating, activated, deactivating or deactivated.
+    """
+    output = run(
+        ["nmcli", "--terse", "--escape", "yes", "--fields", "UUID,STATE", "connection", "show", "--active"]
+    ).stdout
+    states: dict[str, str] = {}
+    for line in output.splitlines():
+        fields = parse_terse_line(line)
+        if len(fields) >= 2 and fields[0]:
+            states[fields[0]] = fields[1]
+    return states
 
 
 def secret_lookup(path: Path, field: str) -> str:
@@ -116,8 +131,11 @@ def secret_store(path: Path, field: str, value: str) -> None:
     )
 
 
-def secret_clear(path: Path) -> None:
-    run(["secret-tool", "clear", "service", APP_ID, "config", config_key(path)], check=False)
+def secret_clear(path: Path, field: str | None = None) -> None:
+    command = ["secret-tool", "clear", "service", APP_ID, "config", config_key(path)]
+    if field:
+        command += ["field", field]
+    run(command, check=False)
 
 
 def discover(directory: Path) -> list[Path]:
@@ -174,7 +192,7 @@ def command_list(args: argparse.Namespace) -> None:
     directory = expand_directory(args.config_dir)
     state = load_state()
     all_connections = nm_connections()
-    active_connections = nm_connections(active_only=True)
+    active_states = nm_active_states()
     changed = False
     profiles = []
 
@@ -186,6 +204,9 @@ def command_list(args: argparse.Namespace) -> None:
             record = {}
             uuid = ""
             changed = True
+        connection_state = active_states.get(uuid, "") if uuid else ""
+        ask_password = bool(record.get("askPassword"))
+        has_username = bool(secret_lookup(path, "username"))
         profiles.append(
             {
                 "path": str(path),
@@ -193,8 +214,12 @@ def command_list(args: argparse.Namespace) -> None:
                 "name": record.get("name", path.stem),
                 "uuid": uuid,
                 "imported": bool(uuid),
-                "active": uuid in active_connections,
-                "hasCredentials": bool(secret_lookup(path, "username") and secret_lookup(path, "password")),
+                # Only an established tunnel is "active". A profile that is still
+                # negotiating (or retrying after AUTH_FAILED) is "connecting".
+                "active": connection_state == "activated",
+                "connecting": connection_state in ("activating", "deactivating"),
+                "hasCredentials": has_username and (ask_password or bool(secret_lookup(path, "password"))),
+                "askPassword": ask_password,
             }
         )
 
@@ -203,24 +228,50 @@ def command_list(args: argparse.Namespace) -> None:
     emit({"ok": True, "directory": str(directory), "directoryExists": directory.is_dir(), "profiles": profiles})
 
 
-def read_credentials() -> tuple[str, str]:
+def read_credentials() -> tuple[str, str, bool]:
     try:
         payload = json.loads(sys.stdin.readline())
     except json.JSONDecodeError as error:
         raise WidgetError("Invalid credentials payload") from error
     username = str(payload.get("username", "")).strip()
     password = str(payload.get("password", ""))
-    if not username or not password:
+    ask_password = payload.get("askPassword") is True
+    if not username:
+        raise WidgetError("Username is required")
+    if not ask_password and not password:
         raise WidgetError("Username and password are required")
-    return username, password
+    return username, password, ask_password
+
+
+def read_connect_password() -> str:
+    """Read a {"password": ...} line, e.g. a one-time password typed in the panel."""
+    try:
+        payload = json.loads(sys.stdin.readline())
+    except json.JSONDecodeError as error:
+        raise WidgetError("Invalid password payload") from error
+    password = str(payload.get("password", "")) if isinstance(payload, dict) else ""
+    if not password:
+        raise WidgetError("Password is required")
+    return password
 
 
 def command_save_credentials(args: argparse.Namespace) -> None:
     path = require_config(args.config)
-    username, password = read_credentials()
+    username, password, ask_password = read_credentials()
+    state = load_state()
+    record = state.setdefault(str(path), {})
     secret_store(path, "username", username)
-    secret_store(path, "password", password)
-    emit({"ok": True, "message": f"Credentials saved for {path.stem}"})
+    if ask_password:
+        # One-time passwords must never be replayed: keep only the username.
+        secret_clear(path, "password")
+        record["askPassword"] = True
+        message = f"Username saved for {path.stem}; the password will be asked on each connection"
+    else:
+        secret_store(path, "password", password)
+        record.pop("askPassword", None)
+        message = f"Credentials saved for {path.stem}"
+    save_state(state)
+    emit({"ok": True, "message": message, "askPassword": ask_password})
 
 
 def command_rename(args: argparse.Namespace) -> None:
@@ -249,12 +300,19 @@ def command_rename(args: argparse.Namespace) -> None:
 
 def command_connect(args: argparse.Namespace) -> None:
     path = require_config(args.config)
-    username = secret_lookup(path, "username")
-    password = secret_lookup(path, "password")
-    if not username or not password:
-        raise WidgetError("Save credentials before connecting")
-
     state = load_state()
+    ask_password = bool(state.get(str(path), {}).get("askPassword"))
+    username = secret_lookup(path, "username")
+    if args.password_stdin:
+        password = read_connect_password()
+    else:
+        password = "" if ask_password else secret_lookup(path, "password")
+    if not username:
+        raise WidgetError("Save credentials before connecting")
+    if not password:
+        raise WidgetError("A password is required to connect this profile" if ask_password
+                          else "Save credentials before connecting")
+
     record = ensure_imported(path, state)
     run(["nmcli", "connection", "modify", "uuid", record["uuid"], "vpn.user-name", username])
 
@@ -263,7 +321,17 @@ def command_connect(args: argparse.Namespace) -> None:
         os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "w") as stream:
             stream.write(f"vpn.secrets.password:{password}\n")
-        run(["nmcli", "connection", "up", "uuid", record["uuid"], "passwd-file", password_file])
+        result = run(
+            ["nmcli", "--wait", str(CONNECT_TIMEOUT_SEC), "connection", "up", "uuid", record["uuid"],
+             "passwd-file", password_file],
+            check=False,
+        )
+        if result.returncode != 0:
+            # Do not leave a profile half-active, e.g. looping on AUTH_FAILED
+            # until NetworkManager's own VPN timeout expires.
+            run(["nmcli", "connection", "down", "uuid", record["uuid"]], check=False)
+            message = " ".join((result.stderr or result.stdout or "nmcli failed").split())
+            raise WidgetError(f"Connection failed: {message}")
     finally:
         # The username is persisted only long enough to activate the profile.
         # The active connection keeps its own snapshot; the saved profile goes
@@ -313,6 +381,12 @@ def parser() -> argparse.ArgumentParser:
     ):
         action_parser = subparsers.add_parser(name)
         action_parser.add_argument("--config", required=True)
+        if name == "connect":
+            action_parser.add_argument(
+                "--password-stdin",
+                action="store_true",
+                help='read {"password": ...} from stdin instead of the keyring (one-time passwords)',
+            )
         action_parser.set_defaults(handler=handler)
     return root
 
