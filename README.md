@@ -100,6 +100,8 @@ When a profile is disconnected, the widget provides actions to:
 
 When a profile is connected, these actions are replaced by a single disconnect button.
 
+While NetworkManager is still negotiating a connection, the profile is shown as **Connecting…** (never as connected) and the same button cancels the attempt. A connection attempt that has not succeeded after 45 seconds is aborted and the profile is brought down, so a rejected password does not leave it retrying in the background.
+
 Forgetting a profile does **not** delete or modify the original `.ovpn` or `.conf` file.
 
 ## Widget settings
